@@ -1,0 +1,7 @@
+# requirements.txt
+# Pin minor versions for reproducible CI runs.
+# Bump periodically and re-test.
+
+PyGithub==2.3.0
+openai==1.30.5
+requests==2.32.3
