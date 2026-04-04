@@ -1,0 +1,47 @@
+name: Daily Issue Classifier
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: "Max issues to classify (0 = all)"
+        required: false
+        default: "0"
+      dry_run:
+        description: "Dry run"
+        required: false
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  issues: read
+jobs:
+  classify-and-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN:   ${{ secrets.GH_PAT }}
+      GITHUB_REPO:    ${{ github.repository }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL:   ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+      MAX_ISSUES:     ${{ inputs.max_issues || vars.MAX_ISSUES || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python classify_github_issues.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: classified-issues-${{ github.run_id }}
+          path: classified_issues.csv
+          retention-days: 7
+      - run: python post_discussion_comment.py
+        env:
+          DISCUSSION_NUMBER: ${{ vars.DISCUSSION_NUMBER }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
