@@ -16,13 +16,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-GITHUB_REPO = os.environ["GITHUB_REPO"]
-DISCUSSION_NUMBER = int(os.environ["DISCUSSION_NUMBER"])
-RUN_URL = os.getenv("RUN_URL", "")
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-CSV_PATH = Path(os.getenv("CSV_PATH", "classified_issues.csv"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+GITHUB_TOKEN = ""
+MAX_RETRIES = 3
+
+def get_int_env(name: str, default: int | None = None) -> int:
+    val = os.getenv(name, "").strip()
+    if not val:
+        if default is not None:
+            return default
+        raise ValueError(f"Missing required environment variable: {name}")
+    try:
+        return int(val)
+    except ValueError:
+        if default is not None:
+            logger.warning("Invalid value for %s: %r. Using default: %d", name, val, default)
+            return default
+        raise ValueError(f"Invalid integer for {name}: {val!r}")
+
 
 GH_GRAPHQL = "https://api.github.com/graphql"
 LABEL_ORDER = ("bug", "feature", "question", "duplicate")
@@ -112,14 +122,26 @@ def graphql(query: str, variables: dict) -> dict:
                 json={"query": query, "variables": variables},
                 timeout=30,
             )
+            # Only retry on 5xx or transient connection errors.
+            # 4xx errors are usually client-side and shouldn't be retried.
+            if 400 <= resp.status_code < 500:
+                resp.raise_for_status()
+
             if resp.status_code >= 500:
-                raise requests.HTTPError(f"server error {resp.status_code}")
+                raise requests.HTTPError(f"Server error {resp.status_code}")
+
             resp.raise_for_status()
             payload = resp.json()
             if "errors" in payload:
-                raise RuntimeError(f"GraphQL errors: {json.dumps(payload['errors'])}")
+                # Do not retry on GraphQL logic errors (e.g. missing discussion)
+                raise ValueError(f"GraphQL errors: {json.dumps(payload['errors'])}")
+
             return payload["data"]
-        except (requests.RequestException, RuntimeError) as exc:
+        except (requests.HTTPError, ValueError) as exc:
+            # Fatal error, do not retry
+            raise exc
+        except (requests.RequestException) as exc:
+            # Transient network error, retry
             last_exc = exc
             wait = min(2 ** attempt, 15)
             logger.warning(
@@ -148,22 +170,41 @@ mutation($discussionId: ID!, $body: String!) {
 
 
 def main() -> None:
-    if "/" not in GITHUB_REPO:
-        raise ValueError(f"GITHUB_REPO must be 'owner/name', got: {GITHUB_REPO!r}")
-    owner, name = GITHUB_REPO.split("/", 1)
+    # Read environment variables inside main to avoid top-level crashes
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    repo = os.getenv("GITHUB_REPO", "").strip()
+    if not token or not repo:
+        missing = [n for n, v in [("GITHUB_TOKEN", token), ("GITHUB_REPO", repo)] if not v]
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
-    rows = load_results(CSV_PATH)
-    body = build_comment(rows, GITHUB_REPO, RUN_URL)
+    if "/" not in repo:
+        raise ValueError(f"GITHUB_REPO must be 'owner/name', got: {repo!r}")
+    owner, name = repo.split("/", 1)
 
-    if DRY_RUN:
+    # Use globals or pass these as arguments to functions.
+    # For simplicity, we'll keep them as local variables and update the global-like usage if needed,
+    # but the graphql() function uses GITHUB_TOKEN from the global scope currently.
+    global GITHUB_TOKEN, MAX_RETRIES
+    GITHUB_TOKEN = token
+    MAX_RETRIES = get_int_env("MAX_RETRIES", 3)
+
+    discussion_number = get_int_env("DISCUSSION_NUMBER")
+    run_url = os.getenv("RUN_URL", "")
+    dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+    csv_path = Path(os.getenv("CSV_PATH", "classified_issues.csv"))
+
+    rows = load_results(csv_path)
+    body = build_comment(rows, repo, run_url)
+
+    if dry_run:
         print(body)
         logger.info("Dry run complete; no comment posted.")
         return
 
-    data = graphql(GET_DISCUSSION_ID, {"owner": owner, "name": name, "number": DISCUSSION_NUMBER})
+    data = graphql(GET_DISCUSSION_ID, {"owner": owner, "name": name, "number": discussion_number})
     disc = data.get("repository", {}).get("discussion") if data else None
     if not disc:
-        raise RuntimeError(f"Discussion #{DISCUSSION_NUMBER} not found in {GITHUB_REPO}.")
+        raise RuntimeError(f"Discussion #{discussion_number} not found in {repo}.")
 
     result = graphql(ADD_COMMENT, {"discussionId": disc["id"], "body": body})
     url = result["addDiscussionComment"]["comment"]["url"]

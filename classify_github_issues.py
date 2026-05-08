@@ -15,13 +15,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_int_env(name: str, default: int) -> int:
+    val = os.getenv(name, "").strip()
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logger.warning("Invalid value for %s: %r. Using default: %d", name, val, default)
+        return default
+
+
+def get_float_env(name: str, default: float) -> float:
+    val = os.getenv(name, "").strip()
+    if not val:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        logger.warning("Invalid value for %s: %r. Using default: %.1f", name, val, default)
+        return default
+
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 REPO_NAME = os.getenv("GITHUB_REPO", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_ISSUES = int(os.getenv("MAX_ISSUES", "0"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_ISSUES = get_int_env("MAX_ISSUES", 0)
+REQUEST_DELAY = get_float_env("REQUEST_DELAY", 0.5)
+MAX_RETRIES = get_int_env("MAX_RETRIES", 3)
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", "classified_issues.csv")
 
 VALID_LABELS = {"bug", "feature", "question", "duplicate"}
