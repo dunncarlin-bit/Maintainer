@@ -16,13 +16,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-GITHUB_REPO = os.environ["GITHUB_REPO"]
-DISCUSSION_NUMBER = int(os.environ["DISCUSSION_NUMBER"])
+def get_int_env(name: str, default: int) -> int:
+    val = os.getenv(name, "").strip()
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")
+DISCUSSION_NUMBER = get_int_env("DISCUSSION_NUMBER", 0)
 RUN_URL = os.getenv("RUN_URL", "")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 CSV_PATH = Path(os.getenv("CSV_PATH", "classified_issues.csv"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_RETRIES = get_int_env("MAX_RETRIES", 3)
 
 GH_GRAPHQL = "https://api.github.com/graphql"
 LABEL_ORDER = ("bug", "feature", "question", "duplicate")
@@ -112,21 +121,40 @@ def graphql(query: str, variables: dict) -> dict:
                 json={"query": query, "variables": variables},
                 timeout=30,
             )
+
+            # Fatal client errors (4xx) - do not retry
+            if 400 <= resp.status_code < 500:
+                logger.error("Fatal client error: %d %s", resp.status_code, resp.text)
+                resp.raise_for_status()
+
+            # Server errors (5xx) - retryable
             if resp.status_code >= 500:
-                raise requests.HTTPError(f"server error {resp.status_code}")
+                raise requests.HTTPError(f"Server error {resp.status_code}", response=resp)
+
             resp.raise_for_status()
             payload = resp.json()
             if "errors" in payload:
+                # Logical GraphQL errors are fatal
                 raise RuntimeError(f"GraphQL errors: {json.dumps(payload['errors'])}")
             return payload["data"]
-        except (requests.RequestException, RuntimeError) as exc:
+
+        except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
-            wait = min(2 ** attempt, 15)
-            logger.warning(
-                "GraphQL call failed (attempt %d/%d): %s; retrying in %ds",
-                attempt, MAX_RETRIES, exc, wait,
-            )
-            time.sleep(wait)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code >= 500:
+                last_exc = exc
+            else:
+                raise  # Re-raise 4xx errors
+        except Exception:
+            raise  # Re-raise other errors (RuntimeError, JSONDecodeError)
+
+        wait = min(2 ** attempt, 15)
+        logger.warning(
+            "GraphQL call failed (attempt %d/%d): %s; retrying in %ds",
+            attempt, MAX_RETRIES, last_exc, wait,
+        )
+        time.sleep(wait)
+
     raise RuntimeError(f"GraphQL call failed after {MAX_RETRIES} retries: {last_exc}")
 
 
@@ -148,6 +176,10 @@ mutation($discussionId: ID!, $body: String!) {
 
 
 def main() -> None:
+    if not GITHUB_TOKEN:
+        raise ValueError("GITHUB_TOKEN is missing")
+    if not DISCUSSION_NUMBER:
+        raise ValueError("DISCUSSION_NUMBER is missing or invalid")
     if "/" not in GITHUB_REPO:
         raise ValueError(f"GITHUB_REPO must be 'owner/name', got: {GITHUB_REPO!r}")
     owner, name = GITHUB_REPO.split("/", 1)
